@@ -1,0 +1,22 @@
+{
+  "preprocessing": "P3_stopword",
+  "preprocessing_config": {
+    "do_case_folding": true,
+    "do_stopwords": true,
+    "do_stemming": false,
+    "do_hapus_angka": false,
+    "min_len": 1
+  },
+  "parameter_terbaik": {
+    "nb__var_smoothing": 1e-09,
+    "w2v__epochs": 50,
+    "w2v__vector_size": 50,
+    "w2v__window": 5
+  },
+  "peta_label": {
+    "sport": 0,
+    "finance": 1
+  },
+  "akurasi_cv": 0.9874,
+  "akurasi_test": 0.975
+}
