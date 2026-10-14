@@ -16,7 +16,15 @@ class BeritaClassifier:
         with open(os.path.join(dir_model, "meta.json"), encoding="utf-8") as f:
             self.meta = json.load(f)
 
-        self.config = self.meta["preprocessing_config"]
+        PETA_PARAM = {
+            "case_folding":     "do_case_folding",
+            "hapus_tanda_baca": "do_hapus_tanda_baca",
+            "hapus_angka":      "do_hapus_angka",
+            "hapus_stopword":   "do_stopwords",
+            "stemming":         "do_stemming",
+        }
+        self.config = {PETA_PARAM.get(k, k): v
+                    for k, v in self.meta["preprocessing_config"].items()}
         self.id_ke_label = {v: k for k, v in self.meta["peta_label"].items()}
 
     def _dokumen_ke_vektor(self, tokens):
