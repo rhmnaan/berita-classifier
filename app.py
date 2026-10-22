@@ -1,162 +1,196 @@
-import html
-import os
-import traceback
-
-import streamlit as st
-
-from src.classifier import BeritaClassifier
-from src.scraper import ScrapeError, ambil_berita
-
-DIR_MODEL = os.path.join(os.path.dirname(__file__), "model_tersimpan")
-RASIO_VOCAB_MIN = 0.4   # di bawah ini, berita dianggap kurang cocok dengan domain model
-
-KATEGORI = {
-    "sport":   {"nama": "Olahraga", "ikon": "⚽", "warna": "#16a34a", "bg": "rgba(22,163,74,0.10)"},
-    "finance": {"nama": "Keuangan", "ikon": "💰", "warna": "#2563eb", "bg": "rgba(37,99,235,0.10)"},
-}
-DEFAULT_KAT = {"nama": "Lainnya", "ikon": "📰", "warna": "#6b7280", "bg": "rgba(107,114,128,0.10)"}
-
-st.set_page_config(page_title="Klasifikasi Berita", page_icon="📰", layout="centered")
-
-CSS = """
-<style>
-#MainMenu, footer, header {visibility: hidden;}
-.block-container {padding-top: 2.5rem; max-width: 760px;}
-
-.hero {text-align: center; margin-bottom: 1.6rem;}
-.hero h1 {font-size: 2.1rem; font-weight: 800; margin: 0 0 .3rem 0; letter-spacing: -0.5px;}
-.hero p {opacity: .65; margin: 0; font-size: 1rem;}
-
-.card {
-    border: 1px solid rgba(128,128,128,0.25);
-    border-radius: 16px; padding: 1.2rem 1.4rem; margin-top: 1.2rem;
-    background: rgba(128,128,128,0.05);
-}
-.card-tag {font-size: .72rem; text-transform: uppercase; letter-spacing: 1.2px; opacity: .55; margin-bottom: .35rem;}
-.card-title {font-size: 1.2rem; font-weight: 700; line-height: 1.35; margin-bottom: .5rem;}
-.card-text {opacity: .8; font-size: .95rem; line-height: 1.6;}
-.card-meta {margin-top: .7rem; font-size: .8rem; opacity: .55;}
-.card-meta a {color: inherit;}
-
-.result {
-    display: flex; align-items: center; gap: 1.3rem;
-    border-radius: 18px; padding: 1.4rem 1.6rem; margin-top: 1.2rem;
-    border: 2px solid;
-}
-.result-icon {font-size: 3.4rem; line-height: 1;}
-.result-small {font-size: .75rem; text-transform: uppercase; letter-spacing: 1.2px; opacity: .6;}
-.result-label {font-size: 2.3rem; font-weight: 800; line-height: 1.15; letter-spacing: 1px;}
-.result-sub {font-size: .95rem; opacity: .75; margin-top: .1rem;}
-
-.bar-wrap {margin-top: .9rem;}
-.bar-row {display: flex; align-items: center; gap: .8rem; margin-bottom: .55rem; font-size: .9rem;}
-.bar-name {width: 80px; font-weight: 600;}
-.bar-track {flex: 1; height: 12px; border-radius: 999px; background: rgba(128,128,128,0.18); overflow: hidden;}
-.bar-fill {height: 100%; border-radius: 999px;}
-.bar-pct {width: 56px; text-align: right; font-variant-numeric: tabular-nums; opacity: .8;}
-</style>
 """
-st.markdown(CSS, unsafe_allow_html=True)
+Aplikasi Streamlit: Klasifikasi Berita (sport vs finance)
+Model : Skip-gram (Word2Vec) + Gaussian Naive Bayes  (hasil notebook, skema P1)
+Input : link berita dari situs APA SAJA
+
+Cara menjalankan:
+    pip install -r requirements.txt
+    streamlit run app.py
+
+Struktur folder:
+    app.py
+    requirements.txt
+    model_tersimpan/            <- dibuat oleh notebook (bagian 11)
+        skipgram_word2vec.model
+        gaussian_nb.joblib
+        meta.json
+"""
+
+import os
+import re
+import json
+
+import joblib
+import numpy as np
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from gensim.models import Word2Vec
+
+DIR_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_tersimpan")
 
 
-def _html(s: str) -> str:
-    """Hilangkan indentasi agar tidak dibaca sebagai code block oleh markdown."""
-    return "\n".join(line.strip() for line in s.strip().splitlines())
-
-
-@st.cache_resource(show_spinner="Memuat model...")
+# =====================================================================
+# 1. MUAT MODEL (sekali saja, lalu disimpan di cache Streamlit)
+# =====================================================================
+@st.cache_resource
 def muat_model():
-    return BeritaClassifier(DIR_MODEL)
+    w2v = Word2Vec.load(os.path.join(DIR_MODEL, "skipgram_word2vec.model"))
+    nb = joblib.load(os.path.join(DIR_MODEL, "gaussian_nb.joblib"))
+    with open(os.path.join(DIR_MODEL, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    return w2v, nb, meta
 
 
-def kartu_berita(berita: dict):
-    judul = html.escape(berita["judul"] or "(judul tidak ditemukan)")
-    cuplikan = berita["teks"][:320] + ("..." if len(berita["teks"]) > 320 else "")
-    n_kata = len(berita["teks"].split())
-    url = html.escape(berita["url"], quote=True)
-    st.markdown(_html(f"""
-    <div class="card">
-        <div class="card-tag">Berita yang dianalisis</div>
-        <div class="card-title">{judul}</div>
-        <div class="card-text">{html.escape(cuplikan)}</div>
-        <div class="card-meta">{n_kata} kata · <a href="{url}" target="_blank">Buka sumber ↗</a></div>
-    </div>
-    """), unsafe_allow_html=True)
+# =====================================================================
+# 2. AMBIL TEKS ARTIKEL DARI LINK (berlaku untuk situs berita apa saja)
+# =====================================================================
+def ambil_teks_dari_url(url):
+    """Download halaman web, lalu ambil judul dan isi artikelnya."""
+    # User-Agent supaya kita terlihat seperti browser biasa
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    respon = requests.get(url, headers=headers, timeout=15)
+    respon.raise_for_status()  # error jika halaman gagal dibuka (404, 403, dst)
+
+    soup = BeautifulSoup(respon.content, "html.parser")
+
+    # Buang bagian yang bukan isi berita (menu, iklan, footer, script)
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
+        tag.decompose()
+
+    judul = soup.title.get_text(strip=True) if soup.title else "(tanpa judul)"
+
+    # Hampir semua situs berita menaruh isi artikel di tag <p> (paragraf).
+    # Paragraf sangat pendek (menu, caption, "baca juga") kita abaikan.
+    paragraf = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+    paragraf = [p for p in paragraf if len(p.split()) >= 5]
+
+    return judul, " ".join(paragraf)
 
 
-def kartu_hasil(hasil: dict):
-    label = hasil["label"]
-    kat = KATEGORI.get(label, DEFAULT_KAT)
-    keyakinan = hasil["proba"][label]
+# =====================================================================
+# 3. PREPROCESSING P1 (sama persis dengan notebook)
+# =====================================================================
+def preprocess(teks):
+    teks = str(teks).lower()               # huruf kecil
+    teks = re.sub(r"[^\w\s]", " ", teks)   # hapus tanda baca
+    return teks.split()                    # pecah jadi token (kata)
 
-    st.markdown(_html(f"""
-    <div class="result" style="border-color:{kat['warna']}; background:{kat['bg']};">
-        <div class="result-icon">{kat['ikon']}</div>
-        <div>
-            <div class="result-small">Kategori berita</div>
-            <div class="result-label" style="color:{kat['warna']};">{html.escape(label.upper())}</div>
-            <div class="result-sub">{kat['nama']} · keyakinan {keyakinan:.1%}</div>
-        </div>
-    </div>
-    """), unsafe_allow_html=True)
 
-    baris = ""
-    for nama, p in sorted(hasil["proba"].items(), key=lambda x: -x[1]):
-        k = KATEGORI.get(nama, DEFAULT_KAT)
-        baris += f"""
-        <div class="bar-row">
-            <div class="bar-name">{html.escape(nama.capitalize())}</div>
-            <div class="bar-track"><div class="bar-fill" style="width:{p*100:.1f}%; background:{k['warna']};"></div></div>
-            <div class="bar-pct">{p:.1%}</div>
-        </div>"""
-    st.markdown(_html(f"""
-    <div class="card">
-        <div class="card-tag">Probabilitas tiap kategori</div>
-        <div class="bar-wrap">{baris}</div>
-    </div>
-    """), unsafe_allow_html=True)
+# =====================================================================
+# 4. TEKS -> VEKTOR DOKUMEN (rata-rata vektor kata, sama dengan notebook)
+# =====================================================================
+def dokumen_ke_vektor(tokens, w2v):
+    vektor = [w2v.wv[t] for t in tokens if t in w2v.wv]  # kata di luar kosakata dilewati
+    if vektor:
+        return np.mean(vektor, axis=0)
+    return np.zeros(w2v.vector_size)
 
-    if hasil["rasio_vocab"] < RASIO_VOCAB_MIN:
+
+# =====================================================================
+# 5. PREDIKSI + TAMPILKAN HASIL
+# =====================================================================
+def prediksi_dan_tampilkan(judul, teks, w2v, nb, meta):
+    tokens = preprocess(teks)
+
+    if len(tokens) == 0:
+        st.error("Teks kosong. Tidak ada yang bisa diklasifikasi.")
+        return
+
+    # Berapa persen kata yang dikenal model? (untuk menilai apakah hasil layak dipercaya)
+    kata_dikenal = [t for t in tokens if t in w2v.wv]
+    persen_dikenal = len(kata_dikenal) / len(tokens) * 100
+
+    # Pipeline: tokens -> vektor dokumen -> Naive Bayes
+    vektor = dokumen_ke_vektor(tokens, w2v).reshape(1, -1)
+    id_kelas = int(nb.predict(vektor)[0])
+    peluang = nb.predict_proba(vektor)[0]
+
+    id_ke_label = {v: k for k, v in meta["peta_label"].items()}
+    label = id_ke_label[id_kelas]
+
+    # ---- Hasil utama ----
+    st.subheader("Hasil Klasifikasi")
+    st.caption(f"Judul halaman: {judul}")
+
+    if label == "sport":
+        st.success("Kategori: SPORT")
+    else:
+        st.info("Kategori: FINANCE")
+
+    kolom1, kolom2 = st.columns(2)
+    kolom1.metric("Peluang sport", f"{peluang[meta['peta_label']['sport']] * 100:.1f}%")
+    kolom2.metric("Peluang finance", f"{peluang[meta['peta_label']['finance']] * 100:.1f}%")
+
+    # ---- Peringatan jika hasil kurang bisa dipercaya ----
+    if len(tokens) < 30:
+        st.warning("Teks terlalu pendek (< 30 kata). Hasil kurang bisa dipercaya.")
+    if persen_dikenal < 50:
         st.warning(
-            "Sebagian besar isi berita ini tidak dikenali sistem. Sistem hanya mengenal kategori "
-            "**sport** dan **finance**, jadi hasil di atas kemungkinan kurang tepat jika berita "
-            "ini berasal dari kategori lain (politik, hiburan, dll.)."
+            f"Hanya {persen_dikenal:.0f}% kata yang dikenal model. "
+            "Kemungkinan artikel ini bukan topik sport/finance."
         )
+    st.caption(
+        "Catatan: model hanya mengenal 2 kategori (sport dan finance). "
+        "Artikel politik, hiburan, dll. tetap akan dipaksa masuk ke salah satunya."
+    )
+
+    # ---- Tahapan proses (untuk presentasi) ----
+    with st.expander("Lihat tahapan proses"):
+        st.markdown("**Tahap 1 — Teks asli (300 karakter pertama)**")
+        st.write(teks[:300] + "...")
+
+        st.markdown("**Tahap 2 — Preprocessing: huruf kecil + hapus tanda baca + tokenisasi**")
+        st.write(tokens[:15])
+        st.write(f"Jumlah kata: {len(tokens)} | Kata dikenal model: {len(kata_dikenal)} ({persen_dikenal:.0f}%)")
+
+        st.markdown("**Tahap 3 — Skip-gram: tiap kata jadi vektor, lalu dirata-rata = vektor dokumen**")
+        st.write(f"Panjang vektor dokumen: {vektor.shape[1]} dimensi. 5 angka pertama:")
+        st.write(np.round(vektor[0][:5], 4))
+
+        st.markdown("**Tahap 4 — Gaussian Naive Bayes memilih kelas dengan peluang tertinggi**")
+        st.write(f"Hasil: **{label}**")
+
+    with st.expander("Lihat teks artikel yang berhasil diambil"):
+        st.write(teks)
 
 
-# ---------------------------------------------------------------- UI
-st.markdown(_html("""
-<div class="hero">
-    <h1>📰 Klasifikasi Berita</h1>
-    <p>Tempel link berita dari situs mana pun, sistem akan menentukan kategorinya.</p>
-</div>
-"""), unsafe_allow_html=True)
+# =====================================================================
+# 6. TAMPILAN HALAMAN
+# =====================================================================
+st.set_page_config(page_title="Klasifikasi Berita", page_icon="📰")
+st.title("📰 Klasifikasi Berita: Sport vs Finance")
+st.write("Model: **Skip-gram (Word2Vec) + Gaussian Naive Bayes**. Bisa dipakai untuk link berita dari situs apa saja.")
 
+# Muat model; hentikan aplikasi dengan pesan jelas jika file model tidak ada
 try:
-    model = muat_model()
-except Exception:
-    st.error("Model gagal dimuat. Pastikan folder `model_tersimpan` berisi semua file model.")
+    w2v, nb, meta = muat_model()
+except Exception as e:
+    st.error(f"Model belum ditemukan di folder '{DIR_MODEL}'. Jalankan dulu bagian 11 notebook. ({e})")
     st.stop()
 
-with st.form("form_link", border=False):
-    url = st.text_input("Link berita", placeholder="https://www.contoh.com/berita/...",
-                        label_visibility="collapsed")
-    kirim = st.form_submit_button("🔍  Klasifikasikan", type="primary", use_container_width=True)
+with st.sidebar:
+    st.header("Info Model")
+    st.write(f"Preprocessing: {meta['preprocessing']}")
+    st.write(f"Akurasi uji: {meta['akurasi_uji'] * 100:.1f}%")
+    st.write(f"Ukuran kosakata: {len(w2v.wv)} kata")
+    st.write(f"Dimensi vektor: {w2v.vector_size}")
 
-if kirim:
-    if not url.strip():
-        st.warning("Masukkan link berita terlebih dahulu.")
+url = st.text_input("Tempel link berita (situs apa saja)", placeholder="https://...")
+
+if st.button("Klasifikasikan", type="primary"):
+    if not url.startswith("http"):
+        st.error("Link harus diawali http:// atau https://")
     else:
         try:
-            with st.spinner("Mengambil dan menganalisis berita..."):
-                berita = ambil_berita(url)
-                hasil = model.predict(berita["teks"])
-            kartu_hasil(hasil)
-            kartu_berita(berita)
-        except ScrapeError as e:
-            st.error(str(e))
-        except Exception as e:
-            traceback.print_exc()   # tampil juga di terminal tempat streamlit dijalankan
-            st.error("Terjadi kesalahan saat memproses berita.")
-            with st.expander("Detail error"):
-                st.code(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+            with st.spinner("Mengambil artikel..."):
+                judul, teks = ambil_teks_dari_url(url)
+            if len(teks.split()) < 20:
+                st.warning(
+                    "Teks yang berhasil diambil sangat sedikit. Mungkin situsnya memblokir "
+                    "scraping atau isinya dimuat dengan JavaScript. Coba link berita lain."
+                )
+            else:
+                prediksi_dan_tampilkan(judul, teks, w2v, nb, meta)
+        except requests.exceptions.RequestException as e:
+            st.error(f"Gagal membuka link: {e}")
