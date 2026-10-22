@@ -1,9 +1,7 @@
 streamlit
+gensim
+scikit-learn
+joblib
+numpy
 requests
 beautifulsoup4
-numpy
-joblib
-gensim
-scikit-learn==1.9.1
-Sastrawi
-trafilatura
